@@ -70,7 +70,7 @@ public final class MainActivity extends Activity implements AdaptBleManager.List
         root.setPadding(dp(20), dp(24), dp(20), dp(40));
         scroll.addView(root, matchWrap());
 
-        TextView eyebrow = text("LACELINK  /  OFFLINE", 12, COLOR_ACCENT);
+        TextView eyebrow = text("LACELINK  /  OFFLINE  ·  V0.1.2", 12, COLOR_ACCENT);
         eyebrow.setTypeface(Typeface.DEFAULT_BOLD);
         eyebrow.setLetterSpacing(0.14f);
         root.addView(eyebrow);
@@ -97,6 +97,11 @@ public final class MainActivity extends Activity implements AdaptBleManager.List
         root.addView(sectionTitle("1  Schuhe finden"), topMargin(matchWrap(), 28));
         scanStatus = text("Bluetooth wird geprüft …", 14, COLOR_MUTED);
         root.addView(scanStatus, topMargin(matchWrap(), 7));
+        TextView pairingHint = text("Erstes Koppeln: Eine Schuhtaste bereits gedrückt halten, "
+                + "während du auf „Verbinden“ tippst. Bis zum Schlüsselaustausch weiter halten.",
+                13, COLOR_MUTED);
+        pairingHint.setLineSpacing(dp(2), 1f);
+        root.addView(pairingHint, topMargin(matchWrap(), 8));
         scanButton = actionButton("Schuhe suchen", true);
         scanButton.setOnClickListener(view -> ensurePermissionsAndBluetooth());
         root.addView(scanButton, topMargin(matchWrap(), 12));
@@ -286,8 +291,9 @@ public final class MainActivity extends Activity implements AdaptBleManager.List
         if (session.getState() == ShoeSession.State.BONDING
                 || session.getState() == ShoeSession.State.NEEDS_APP_PAIRING
                 || session.getState() == ShoeSession.State.KEY_EXCHANGE) {
-            TextView help = text("Tipp: Schuh aufwecken. Zum Koppeln eine Schuhtaste gedrückt halten "
-                    + "und den Systemdialog bestätigen.", 13, COLOR_MUTED);
+            TextView help = text("Tipp: Beim ersten Koppeln eine Schuhtaste schon vor „Verbinden“ "
+                    + "gedrückt halten, den Systemdialog bestätigen und bis zum Schlüsselaustausch "
+                    + "weiter halten.", 13, COLOR_MUTED);
             help.setLineSpacing(dp(2), 1f);
             card.addView(help, topMargin(matchWrap(), 9));
         }

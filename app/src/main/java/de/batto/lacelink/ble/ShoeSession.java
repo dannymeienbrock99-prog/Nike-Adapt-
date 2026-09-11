@@ -64,8 +64,11 @@ public final class ShoeSession {
     }
 
     private static final String PREFS = "shoe_keys";
+    private static final String APP_VERSION = "0.1.2";
     private static final long NORMAL_TIMEOUT_MS = 5_000L;
     private static final long NOTIFICATION_SETUP_TIMEOUT_MS = 30_000L;
+    private static final long KEY_EXCHANGE_RETRY_DELAY_MS = 900L;
+    private static final int MAX_KEY_EXCHANGE_ATTEMPTS = 4;
     private static final int GATT_SUCCESS = BluetoothGatt.GATT_SUCCESS;
     private static final int GATT_INSUFFICIENT_AUTHENTICATION = 5;
     private static final int GATT_INSUFFICIENT_ENCRYPTION = 15;
@@ -91,7 +94,11 @@ public final class ShoeSession {
     private List<byte[]> outgoingFrames;
     private int outgoingFrameIndex;
     private int outstandingFrames;
+    private int pendingResendSequence = -1;
+    private int keyExchangeAttempt;
     private int txSequence;
+    private int rxWindowBase;
+    private int rxFrameCount;
     private boolean transportWritePending;
     private boolean notificationsReady;
     private boolean notificationWritePending;
@@ -112,6 +119,12 @@ public final class ShoeSession {
         disconnectAndCloseGatt();
         resetConnection();
         fail(error);
+    };
+
+    private final Runnable keyExchangeRetry = () -> {
+        if (notificationsReady && state == State.NEEDS_APP_PAIRING) {
+            attemptApplicationKeyExchange();
+        }
     };
 
     private final BroadcastReceiver bondReceiver = new BroadcastReceiver() {
@@ -240,6 +253,7 @@ public final class ShoeSession {
             }
             registerBondReceiver();
             setState(State.CONNECTING, "Verbinde …");
+            log("LaceLink " + APP_VERSION + " – CoreRF-Verbindung");
             log("GATT-Verbindung wird geöffnet");
             try {
                 gatt = device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE);
@@ -274,33 +288,59 @@ public final class ShoeSession {
     }
 
     public void pairApplicationKey() {
-        handler.post(() -> {
-            if (!notificationsReady) {
-                message("Erst die Bluetooth-Verbindung vollständig herstellen.");
-                return;
-            }
-            if (currentRequest != null || state == State.KEY_EXCHANGE || state == State.AUTHENTICATING) {
-                message("Die Kopplung läuft bereits.");
-                return;
-            }
-            preferences.edit().remove(keyPreference()).apply();
-            setState(State.KEY_EXCHANGE, "Schuhtaste bestätigen – Schlüsselaustausch läuft …");
-            log("CoreRF-Schlüsselaustausch gestartet");
-            sendRequest(CoreRfProtocol.OP_START_KEY_EXCHANGE, null, 40_000L, new ResponseCallback() {
-                @Override
-                public void onSuccess(CoreRfProtocol.Message response) {
-                    Long field = CoreRfProtocol.readVarintField(response.payload, 1);
-                    int group = field == null && response.payload.length == 0 ? 0 :
-                            field == null ? -1 : field.intValue();
-                    createDhKey(group);
-                }
+        handler.post(this::beginApplicationPairing);
+    }
 
-                @Override
-                public void onError(String error) {
-                    pairingFailed(error);
-                }
-            });
+    private void beginApplicationPairing() {
+        if (!notificationsReady) {
+            message("Erst die Bluetooth-Verbindung vollständig herstellen.");
+            return;
+        }
+        if (currentRequest != null || state == State.KEY_EXCHANGE || state == State.AUTHENTICATING) {
+            message("Die Kopplung läuft bereits.");
+            return;
+        }
+        handler.removeCallbacks(keyExchangeRetry);
+        preferences.edit().remove(keyPreference()).apply();
+        keyExchangeAttempt = 0;
+        attemptApplicationKeyExchange();
+    }
+
+    private void attemptApplicationKeyExchange() {
+        if (!notificationsReady || currentRequest != null) {
+            return;
+        }
+        keyExchangeAttempt++;
+        setState(State.KEY_EXCHANGE, "Schuhtaste gedrückt halten – Versuch "
+                + keyExchangeAttempt + "/" + MAX_KEY_EXCHANGE_ATTEMPTS + " …");
+        log("CoreRF-Schlüsselaustausch gestartet, Versuch " + keyExchangeAttempt);
+        sendRequest(CoreRfProtocol.OP_START_KEY_EXCHANGE, null, 12_000L, new ResponseCallback() {
+            @Override
+            public void onSuccess(CoreRfProtocol.Message response) {
+                Long field = CoreRfProtocol.readVarintField(response.payload, 1);
+                int group = field == null && response.payload.length == 0 ? 0 :
+                        field == null ? -1 : field.intValue();
+                log("MODP-Gruppe vom Schuh: " + group);
+                createDhKey(group);
+            }
+
+            @Override
+            public void onError(String error) {
+                retryApplicationKeyExchange(error);
+            }
         });
+    }
+
+    private void retryApplicationKeyExchange(String error) {
+        if (notificationsReady && gatt != null && keyExchangeAttempt < MAX_KEY_EXCHANGE_ATTEMPTS) {
+            log("Schlüsselaustausch noch nicht angenommen: " + error);
+            setState(State.NEEDS_APP_PAIRING,
+                    "Schuhtaste weiter gedrückt halten – nächster Versuch …");
+            handler.removeCallbacks(keyExchangeRetry);
+            handler.postDelayed(keyExchangeRetry, KEY_EXCHANGE_RETRY_DELAY_MS);
+            return;
+        }
+        pairingFailed(error);
     }
 
     public void refreshBattery() {
@@ -544,11 +584,12 @@ public final class ShoeSession {
         notificationWritePending = false;
         notificationsReady = true;
         log("CoreRF-Benachrichtigungen aktiv");
-        readStandardBattery();
         byte[] storedKey = readStoredKey();
         if (storedKey == null) {
             setState(State.NEEDS_APP_PAIRING,
-                    "Schuhtaste halten, dann „Schlüssel koppeln“ tippen");
+                    "Schuhtaste gedrückt halten – Kopplung startet automatisch …");
+            log("Kein App-Schlüssel gespeichert – automatische Kopplung");
+            handler.postDelayed(this::beginApplicationPairing, 150L);
         } else {
             startAuthentication(storedKey, false);
         }
@@ -656,13 +697,16 @@ public final class ShoeSession {
     }
 
     private void pairingFailed(String error) {
+        handler.removeCallbacks(keyExchangeRetry);
         preferences.edit().remove(keyPreference()).apply();
+        log("App-Kopplung fehlgeschlagen: " + error);
         setState(State.NEEDS_APP_PAIRING, "Kopplung fehlgeschlagen – Schuhtaste erneut halten");
         message(error);
     }
 
     private void authenticationFailed(String error) {
         preferences.edit().remove(keyPreference()).apply();
+        log("Authentifizierung fehlgeschlagen: " + error);
         setState(State.NEEDS_APP_PAIRING, "Schlüssel nicht akzeptiert – neu koppeln");
         message("Authentifizierung fehlgeschlagen: " + error);
     }
@@ -687,6 +731,7 @@ public final class ShoeSession {
         outgoingFrames = new ArrayList<>(segmented.frames);
         outgoingFrameIndex = 0;
         outstandingFrames = 0;
+        pendingResendSequence = -1;
         transportWritePending = false;
         Request scheduled = currentRequest;
         scheduled.timeoutRunnable = () -> {
@@ -709,12 +754,15 @@ public final class ShoeSession {
         }
         byte[] frame = outgoingFrames.get(outgoingFrameIndex);
         transportWritePending = true;
+        log("TX Frame " + CoreRfProtocol.hex(frame));
         enqueueGatt(GattOperation.write(writeCharacteristic, frame, () -> {
             transportWritePending = false;
             outstandingFrames++;
             outgoingFrameIndex++;
-            if (outgoingFrameIndex >= outgoingFrames.size()) {
-                outgoingFrames = null;
+            if (pendingResendSequence >= 0) {
+                int sequence = pendingResendSequence;
+                pendingResendSequence = -1;
+                rewindTransport(sequence);
             } else {
                 pumpTransport();
             }
@@ -732,10 +780,14 @@ public final class ShoeSession {
         if (CoreRfProtocol.isFlowControl(frame)) {
             int type = CoreRfProtocol.flowControlType(frame);
             if (type == 0) {
+                log("Transportfenster bestätigt, Sequenz " + CoreRfProtocol.sequenceOf(frame));
                 outstandingFrames = 0;
                 pumpTransport();
             } else if (type == 1) {
-                finishCurrentWithError("Schuh fordert Paketwiederholung an");
+                requestTransportResend(CoreRfProtocol.sequenceOf(frame));
+            } else if (type == 2) {
+                finishCurrentWithError("CoreRF-Transportfehler bei Sequenz "
+                        + CoreRfProtocol.sequenceOf(frame));
             } else {
                 finishCurrentWithError("Transportfehler " + type);
             }
@@ -743,7 +795,12 @@ public final class ShoeSession {
         }
         int sequence = CoreRfProtocol.sequenceOf(frame);
         byte[] messageBytes = reassembler.accept(frame);
-        enqueueFlowControl(CoreRfProtocol.flowControlAck(sequence));
+        rxFrameCount++;
+        if (rxFrameCount > 1 && sequenceDistance(rxWindowBase, sequence) == 1) {
+            byte[] acknowledgement = CoreRfProtocol.flowControlAck(sequence);
+            rxWindowBase = (sequence + 1) & 0x3f;
+            enqueueFlowControl(acknowledgement);
+        }
         if (messageBytes == null) {
             return;
         }
@@ -755,7 +812,38 @@ public final class ShoeSession {
         handleMessage(message);
     }
 
+    private void requestTransportResend(int sequence) {
+        if (currentRequest == null || outgoingFrames == null) {
+            log("Wiederholungsanforderung ohne aktiven Befehl, Sequenz " + sequence);
+            return;
+        }
+        log("CoreRF fordert Wiederholung ab Sequenz " + sequence);
+        if (transportWritePending) {
+            pendingResendSequence = sequence;
+        } else {
+            rewindTransport(sequence);
+        }
+    }
+
+    private void rewindTransport(int sequence) {
+        if (outgoingFrames == null) {
+            return;
+        }
+        for (int index = 0; index < outgoingFrames.size(); index++) {
+            if (CoreRfProtocol.sequenceOf(outgoingFrames.get(index)) == sequence) {
+                outgoingFrameIndex = index;
+                outstandingFrames = 0;
+                log("TX wird ab Sequenz " + sequence + " wiederholt");
+                pumpTransport();
+                return;
+            }
+        }
+        finishCurrentWithError("Angeforderte Sequenz " + sequence + " ist nicht mehr verfügbar");
+    }
+
     private void handleMessage(CoreRfProtocol.Message message) {
+        log("RX Nachricht 0x" + Integer.toHexString(message.opcode).toUpperCase()
+                + " · " + actionName(message.action));
         if (message.opcode == CoreRfProtocol.OP_BATTERY && message.payload.length > 0) {
             Integer percent = CoreRfProtocol.batteryPercent(message.payload);
             if (percent != null) {
@@ -800,6 +888,7 @@ public final class ShoeSession {
         outgoingFrames = null;
         outgoingFrameIndex = 0;
         outstandingFrames = 0;
+        pendingResendSequence = -1;
         transportWritePending = false;
     }
 
@@ -807,6 +896,7 @@ public final class ShoeSession {
         if (writeCharacteristic == null) {
             return;
         }
+        log("TX Flussbestätigung " + CoreRfProtocol.hex(value));
         enqueueGatt(GattOperation.write(writeCharacteristic, value, () -> {
         }, status -> log("Flow-Control-Antwort fehlgeschlagen: " + status)));
     }
@@ -931,6 +1021,7 @@ public final class ShoeSession {
 
     private void resetConnection() {
         handler.removeCallbacks(notificationSetupTimeout);
+        handler.removeCallbacks(keyExchangeRetry);
         notificationsReady = false;
         notificationWritePending = false;
         notificationDescriptorWritten = false;
@@ -942,7 +1033,11 @@ public final class ShoeSession {
         requests.clear();
         clearCurrent();
         reassembler.reset();
+        txSequence = 0;
+        rxWindowBase = 0;
+        rxFrameCount = 0;
         batteryPercent = -1;
+        keyExchangeAttempt = 0;
     }
 
     private byte[] readStoredKey() {
@@ -1008,6 +1103,27 @@ public final class ShoeSession {
             return "Kopplung läuft";
         }
         return "nicht gekoppelt";
+    }
+
+    private static String actionName(int action) {
+        if (action == CoreRfProtocol.ACTION_ACK) {
+            return "ACK";
+        }
+        if (action == CoreRfProtocol.ACTION_NAK) {
+            return "NAK";
+        }
+        if (action == CoreRfProtocol.ACTION_EVENT) {
+            return "EVENT";
+        }
+        return "REQUEST";
+    }
+
+    private static int sequenceDistance(int from, int to) {
+        int adjustedTo = to;
+        if (from > adjustedTo) {
+            adjustedTo += 64;
+        }
+        return adjustedTo - from;
     }
 
     private static byte[] copy(byte[] value) {

@@ -55,4 +55,23 @@ public class CoreRfProtocolTest {
         assertNull(reassembler.accept(new byte[]{1, 10}));
         assertNull(reassembler.accept(new byte[]{3, 11}));
     }
+
+    @Test
+    public void keyExchangeAndResendFramesMatchCoreRfWireFormat() {
+        byte[] request = CoreRfProtocol.request(CoreRfProtocol.OP_START_KEY_EXCHANGE, null);
+        assertArrayEquals(new byte[]{110, 0, 0}, request);
+        assertArrayEquals(new byte[]{(byte) 0x80, 110, 0, 0},
+                CoreRfProtocol.segment(request, 0).frames.get(0));
+
+        byte[] resend = new byte[]{(byte) 0xc0, 1};
+        assertEquals(true, CoreRfProtocol.isFlowControl(resend));
+        assertEquals(0, CoreRfProtocol.sequenceOf(resend));
+        assertEquals(1, CoreRfProtocol.flowControlType(resend));
+
+        CoreRfProtocol.Message nak = CoreRfProtocol.parseMessage(
+                new byte[]{111, 0, (byte) 0x80});
+        assertNotNull(nak);
+        assertEquals(CoreRfProtocol.OP_PUBLIC_KEY, nak.opcode);
+        assertEquals(CoreRfProtocol.ACTION_NAK, nak.action);
+    }
 }
