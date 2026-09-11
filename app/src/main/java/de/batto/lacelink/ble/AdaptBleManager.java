@@ -6,6 +6,7 @@ import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothManager;
 import android.bluetooth.le.BluetoothLeScanner;
 import android.bluetooth.le.ScanCallback;
+import android.bluetooth.le.ScanFilter;
 import android.bluetooth.le.ScanResult;
 import android.bluetooth.le.ScanSettings;
 import android.content.Context;
@@ -17,6 +18,7 @@ import de.batto.lacelink.protocol.CoreRfProtocol;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -53,6 +55,8 @@ public final class AdaptBleManager implements ShoeSession.Listener {
     }
 
     private static final long SCAN_DURATION_MS = 12_000L;
+    private static final int ADAPT_MANUFACTURER_ID = 120;
+    private static final byte[] ADAPT_MANUFACTURER_PREFIX = {(byte) 0xaf, 0x28};
 
     private final Context context;
     private final Listener listener;
@@ -123,8 +127,11 @@ public final class AdaptBleManager implements ShoeSession.Listener {
         ScanSettings settings = new ScanSettings.Builder()
                 .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
                 .build();
+        ScanFilter adaptFilter = new ScanFilter.Builder()
+                .setManufacturerData(ADAPT_MANUFACTURER_ID, ADAPT_MANUFACTURER_PREFIX)
+                .build();
         try {
-            scanner.startScan(null, settings, scanCallback);
+            scanner.startScan(Collections.singletonList(adaptFilter), settings, scanCallback);
             scanning = true;
             listener.onScanStateChanged(true, "Suche 12 Sekunden …");
             handler.postDelayed(scanTimeout, SCAN_DURATION_MS);
@@ -221,6 +228,7 @@ public final class AdaptBleManager implements ShoeSession.Listener {
             String recordName = result.getScanRecord() == null ? null : result.getScanRecord().getDeviceName();
             String name = safeName(device, recordName);
             boolean coreRf = false;
+            boolean adaptManufacturer = false;
             if (result.getScanRecord() != null && result.getScanRecord().getServiceUuids() != null) {
                 for (ParcelUuid uuid : result.getScanRecord().getServiceUuids()) {
                     if (CoreRfProtocol.SERVICE_UUID.equals(uuid.getUuid())) {
@@ -229,12 +237,18 @@ public final class AdaptBleManager implements ShoeSession.Listener {
                     }
                 }
             }
-            // Keep named devices so shoes with older advertising firmware remain selectable.
-            if (!coreRf && "Unbekanntes BLE-Gerät".equals(name)) {
-                return;
+            if (result.getScanRecord() != null) {
+                byte[] data = result.getScanRecord().getManufacturerSpecificData(ADAPT_MANUFACTURER_ID);
+                adaptManufacturer = data != null && data.length >= 2
+                        && data[0] == ADAPT_MANUFACTURER_PREFIX[0]
+                        && data[1] == ADAPT_MANUFACTURER_PREFIX[1];
+            }
+            if (adaptManufacturer && "Unbekanntes BLE-Gerät".equals(name)) {
+                name = "Adapt BB";
             }
             ScanCandidate previous = candidates.get(address);
-            boolean advertised = coreRf || (previous != null && previous.advertisesCoreRf);
+            boolean advertised = coreRf || adaptManufacturer
+                    || (previous != null && previous.advertisesCoreRf);
             candidates.put(address, new ScanCandidate(device, name, address, result.getRssi(), advertised));
             publishCandidates();
         });
