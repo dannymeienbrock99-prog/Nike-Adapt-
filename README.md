@@ -52,7 +52,7 @@ Die App arbeitet offline und fordert keine Internetberechtigung an. BLE-Adressen
 ## Entwicklung
 
 ```bash
-gradle testDebugUnitTest assembleDebug
+./gradlew testDebugUnitTest assembleDebug
 ```
 
 Die CI verwendet Gradle 8.7, Android Gradle Plugin 8.6.1 und JDK 17.
