@@ -13,6 +13,7 @@ import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
 import android.os.Bundle;
+import android.provider.Settings;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -70,7 +71,7 @@ public final class MainActivity extends Activity implements AdaptBleManager.List
         root.setPadding(dp(20), dp(24), dp(20), dp(40));
         scroll.addView(root, matchWrap());
 
-        TextView eyebrow = text("LACELINK  /  OFFLINE  ·  V0.1.2", 12, COLOR_ACCENT);
+        TextView eyebrow = text("LACELINK  /  OFFLINE  ·  V0.1.3", 12, COLOR_ACCENT);
         eyebrow.setTypeface(Typeface.DEFAULT_BOLD);
         eyebrow.setLetterSpacing(0.14f);
         root.addView(eyebrow);
@@ -97,8 +98,8 @@ public final class MainActivity extends Activity implements AdaptBleManager.List
         root.addView(sectionTitle("1  Schuhe finden"), topMargin(matchWrap(), 28));
         scanStatus = text("Bluetooth wird geprüft …", 14, COLOR_MUTED);
         root.addView(scanStatus, topMargin(matchWrap(), 7));
-        TextView pairingHint = text("Erstes Koppeln: Eine Schuhtaste bereits gedrückt halten, "
-                + "während du auf „Verbinden“ tippst. Bis zum Schlüsselaustausch weiter halten.",
+        TextView pairingHint = text("Erstes Koppeln: Schuhe aufwecken und den Android-Systemdialog "
+                + "bestätigen. Eine Taste erst dann einmal kurz drücken, wenn „TASTE DRÜCKEN“ erscheint.",
                 13, COLOR_MUTED);
         pairingHint.setLineSpacing(dp(2), 1f);
         root.addView(pairingHint, topMargin(matchWrap(), 8));
@@ -288,13 +289,26 @@ public final class MainActivity extends Activity implements AdaptBleManager.List
         status.setLineSpacing(dp(2), 1f);
         card.addView(status, topMargin(matchWrap(), 14));
 
-        if (session.getState() == ShoeSession.State.BONDING
-                || session.getState() == ShoeSession.State.NEEDS_APP_PAIRING
-                || session.getState() == ShoeSession.State.KEY_EXCHANGE) {
-            TextView help = text("Tipp: Beim ersten Koppeln eine Schuhtaste schon vor „Verbinden“ "
-                    + "gedrückt halten, den Systemdialog bestätigen und bis zum Schlüsselaustausch "
-                    + "weiter halten.", 13, COLOR_MUTED);
+        if (session.getState() == ShoeSession.State.BONDING) {
+            TextView help = text("Bestätige den Android-Systemdialog. Für den App-Schlüssel noch "
+                    + "keine Taste gedrückt halten.", 13, COLOR_MUTED);
             help.setLineSpacing(dp(2), 1f);
+            card.addView(help, topMargin(matchWrap(), 9));
+        } else if (session.getState() == ShoeSession.State.WAITING_FOR_CONFIRMATION) {
+            TextView help = text("Jetzt eine der leuchtenden Tasten am Schuh einmal kurz drücken – "
+                    + "nicht gedrückt halten.", 14, COLOR_ACCENT);
+            help.setTypeface(Typeface.DEFAULT_BOLD);
+            help.setLineSpacing(dp(2), 1f);
+            card.addView(help, topMargin(matchWrap(), 9));
+        } else if (session.getState() == ShoeSession.State.ALREADY_PAIRED) {
+            TextView help = text("System-Reset für beide Schuhe:\n"
+                    + "1. Beide Tasten 5 Sekunden halten; bei roten LEDs loslassen.\n"
+                    + "2. Eine Taste halten. Sobald die Lichter angehen, die andere Taste dreimal "
+                    + "drücken, bis die Lichter grün werden.\n"
+                    + "3. Am zweiten Schuh wiederholen.\n"
+                    + "4. Danach beide Schuhe in den Android-Bluetooth-Einstellungen vergessen.",
+                    13, COLOR_DANGER);
+            help.setLineSpacing(dp(3), 1f);
             card.addView(help, topMargin(matchWrap(), 9));
         }
 
@@ -305,17 +319,21 @@ public final class MainActivity extends Activity implements AdaptBleManager.List
         pair.setOnClickListener(view -> session.pairApplicationKey());
         setupActions.addView(pair);
 
+        if (session.getState() == ShoeSession.State.ALREADY_PAIRED) {
+            Button bluetoothSettings = smallButton("Bluetooth-Einstellungen");
+            bluetoothSettings.setOnClickListener(view -> openBluetoothSettings());
+            setupActions.addView(bluetoothSettings, leftMargin(wrapWrap(), 8));
+        }
+
         Button refresh = smallButton("Akku lesen");
         refresh.setEnabled(session.isReady());
         refresh.setAlpha(refresh.isEnabled() ? 1f : 0.4f);
         refresh.setOnClickListener(view -> session.refreshBattery());
         setupActions.addView(refresh, leftMargin(wrapWrap(), 8));
 
-        Button reconnect = smallButton(session.getState() == ShoeSession.State.DISCONNECTED
-                || session.getState() == ShoeSession.State.ERROR ? "Neu verbinden" : "Trennen");
+        Button reconnect = smallButton(session.canConnect() ? "Neu verbinden" : "Trennen");
         reconnect.setOnClickListener(view -> {
-            if (session.getState() == ShoeSession.State.DISCONNECTED
-                    || session.getState() == ShoeSession.State.ERROR) {
+            if (session.canConnect()) {
                 session.connect();
             } else {
                 session.disconnect();
@@ -459,6 +477,14 @@ public final class MainActivity extends Activity implements AdaptBleManager.List
                 .show();
     }
 
+    private void openBluetoothSettings() {
+        try {
+            startActivity(new Intent(Settings.ACTION_BLUETOOTH_SETTINGS));
+        } catch (RuntimeException error) {
+            showMessage("Bluetooth-Einstellungen konnten nicht geöffnet werden.");
+        }
+    }
+
     private TextView sectionTitle(String value) {
         TextView title = text(value, 18, COLOR_TEXT);
         title.setTypeface(Typeface.DEFAULT_BOLD);
@@ -479,6 +505,10 @@ public final class MainActivity extends Activity implements AdaptBleManager.List
                 return "APP-KOPPLUNG";
             case KEY_EXCHANGE:
                 return "SCHLÜSSEL";
+            case WAITING_FOR_CONFIRMATION:
+                return "TASTE DRÜCKEN";
+            case ALREADY_PAIRED:
+                return "BEREITS GEKOPPELT";
             case AUTHENTICATING:
                 return "ANMELDUNG";
             case READY:
@@ -491,10 +521,11 @@ public final class MainActivity extends Activity implements AdaptBleManager.List
     }
 
     private int stateColor(ShoeSession.State state) {
-        if (state == ShoeSession.State.READY) {
+        if (state == ShoeSession.State.READY
+                || state == ShoeSession.State.WAITING_FOR_CONFIRMATION) {
             return COLOR_ACCENT;
         }
-        if (state == ShoeSession.State.ERROR) {
+        if (state == ShoeSession.State.ERROR || state == ShoeSession.State.ALREADY_PAIRED) {
             return COLOR_DANGER;
         }
         return COLOR_MUTED;

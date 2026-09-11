@@ -2,7 +2,7 @@
 
 Eine eigenständige, inoffizielle Android-App zur lokalen Steuerung von **Adapt BB / BB 2.0** über Bluetooth Low Energy. Sie benötigt weder Nike-Konto noch Internetverbindung.
 
-> Status: experimenteller erster Hardware-Build. Der Quellcode und das Paketformat sind statisch getestet; ein echter Schuh-Hardwaretest steht noch aus. Beim ersten Test bitte den Fuß aus dem Schuh nehmen.
+> Status: experimenteller Hardware-Build. GATT, Transport und die Erkennung „bereits gekoppelt“ wurden mit einem echten Schuhprotokoll abgeglichen. Eine erfolgreiche Neukopplung nach System-Reset muss noch an der Hardware bestätigt werden. Beim ersten Test bitte den Fuß aus dem Schuh nehmen.
 
 ## Funktionen
 
@@ -28,11 +28,11 @@ Alternativ lässt sich das Projekt mit Android Studio (JDK 17, Android SDK 35) �
 
 1. Erlaube **Geräte in der Nähe** und schalte Bluetooth ein.
 2. Wecke beide Schuhe auf und tippe **Schuhe suchen**.
-3. Verbinde den ersten Schuh und bestätige den Android-Systemdialog. Dabei eine Taste am Schuh gedrückt halten.
-4. Wenn **APP-KOPPLUNG** erscheint, halte erneut eine Schuhtaste und tippe **Schlüssel koppeln**.
+3. Verbinde den ersten Schuh und bestätige den Android-Systemdialog. Halte dabei keine Taste dauerhaft gedrückt.
+4. Warte auf **TASTE DRÜCKEN**. Drücke dann eine der leuchtenden Schuhtasten einmal kurz.
 5. Wiederhole die Schritte für den zweiten Schuh. Steuerungen werden erst bei Status **BEREIT** aktiv.
 
-Wenn ein Schuh aus einer alten Kopplung hängen bleibt, entferne **beide** Schuhe zuerst in den Android-Bluetooth-Einstellungen, schließe die frühere Adapt-App vollständig und beginne neu. Zu häufiges Scannen kann Android vorübergehend drosseln; dann etwa 30 Sekunden warten.
+Wenn **BEREITS GEKOPPELT** erscheint, wiederholt LaceLink die abgelehnte Anfrage nicht. Setze beide Schuhe nach der [offiziellen Nike-Anleitung](https://www.nike.com/help/a/adapt-troubleshooting) zurück: Beide Tasten fünf Sekunden halten und bei roten LEDs loslassen. Dann eine Taste halten; sobald die Lichter angehen, die andere Taste dreimal drücken, bis die Lichter grün werden. Am zweiten Schuh wiederholen. Danach **beide** Schuhe in den Android-Bluetooth-Einstellungen vergessen und neu beginnen.
 
 ## Technischer Aufbau
 

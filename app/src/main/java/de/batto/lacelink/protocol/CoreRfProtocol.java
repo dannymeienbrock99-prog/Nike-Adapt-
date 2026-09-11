@@ -13,6 +13,13 @@ import java.util.UUID;
  * Adapt BB-era footwear. It intentionally contains no firmware/update commands.
  */
 public final class CoreRfProtocol {
+    public enum KeyExchangeSignal {
+        OTHER,
+        CONFIRMATION_REQUIRED,
+        ALREADY_PAIRED,
+        GROUP_ACCEPTED
+    }
+
     public static final UUID SERVICE_UUID = UUID.fromString("1a2328af-3d0b-4b04-a2aa-973c239d3904");
     public static final UUID WRITE_UUID = UUID.fromString("226baea6-1543-40c2-8eae-a69b02171b08");
     public static final UUID NOTIFY_UUID = UUID.fromString("30c4142f-b083-42cf-865a-d5b91801bcd7");
@@ -74,6 +81,28 @@ public final class CoreRfProtocol {
             return null;
         }
         return new Message(bytes[0] & 0xff, action, Arrays.copyOfRange(bytes, 3, 3 + payloadLength));
+    }
+
+    /**
+     * Classifies messages received while opcode 0x6E is pending. CoreRF uses a
+     * 0x6F EVENT as a user-intervention prompt; it is not the MODP response.
+     */
+    public static KeyExchangeSignal classifyStartKeyExchangeMessage(Message message) {
+        if (message == null) {
+            return KeyExchangeSignal.OTHER;
+        }
+        boolean keyExchangeOpcode = message.opcode == OP_START_KEY_EXCHANGE
+                || message.opcode == OP_PUBLIC_KEY;
+        if (keyExchangeOpcode && message.action == ACTION_NAK) {
+            return KeyExchangeSignal.ALREADY_PAIRED;
+        }
+        if (message.opcode == OP_PUBLIC_KEY && message.action == ACTION_EVENT) {
+            return KeyExchangeSignal.CONFIRMATION_REQUIRED;
+        }
+        if (message.opcode == OP_START_KEY_EXCHANGE && message.action == ACTION_ACK) {
+            return KeyExchangeSignal.GROUP_ACCEPTED;
+        }
+        return KeyExchangeSignal.OTHER;
     }
 
     public static SegmentedMessage segment(byte[] message, int initialSequence) {

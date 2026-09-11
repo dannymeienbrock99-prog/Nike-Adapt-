@@ -48,6 +48,8 @@ public final class ShoeSession {
         ENABLING_NOTIFICATIONS,
         NEEDS_APP_PAIRING,
         KEY_EXCHANGE,
+        WAITING_FOR_CONFIRMATION,
+        ALREADY_PAIRED,
         AUTHENTICATING,
         READY,
         ERROR
@@ -64,11 +66,10 @@ public final class ShoeSession {
     }
 
     private static final String PREFS = "shoe_keys";
-    private static final String APP_VERSION = "0.1.2";
+    private static final String APP_VERSION = "0.1.3";
     private static final long NORMAL_TIMEOUT_MS = 5_000L;
     private static final long NOTIFICATION_SETUP_TIMEOUT_MS = 30_000L;
-    private static final long KEY_EXCHANGE_RETRY_DELAY_MS = 900L;
-    private static final int MAX_KEY_EXCHANGE_ATTEMPTS = 4;
+    private static final long KEY_EXCHANGE_TIMEOUT_MS = 45_000L;
     private static final int GATT_SUCCESS = BluetoothGatt.GATT_SUCCESS;
     private static final int GATT_INSUFFICIENT_AUTHENTICATION = 5;
     private static final int GATT_INSUFFICIENT_ENCRYPTION = 15;
@@ -95,7 +96,6 @@ public final class ShoeSession {
     private int outgoingFrameIndex;
     private int outstandingFrames;
     private int pendingResendSequence = -1;
-    private int keyExchangeAttempt;
     private int txSequence;
     private int rxWindowBase;
     private int rxFrameCount;
@@ -114,17 +114,10 @@ public final class ShoeSession {
         if (notificationsReady || gatt == null) {
             return;
         }
-        String error = "System-Kopplung nicht abgeschlossen. Schuhtaste gedrückt halten, "
-                + "Android-Dialog bestätigen und erneut verbinden.";
+        String error = "Android-Systemkopplung nicht abgeschlossen. Dialog bestätigen und erneut verbinden.";
         disconnectAndCloseGatt();
         resetConnection();
         fail(error);
-    };
-
-    private final Runnable keyExchangeRetry = () -> {
-        if (notificationsReady && state == State.NEEDS_APP_PAIRING) {
-            attemptApplicationKeyExchange();
-        }
     };
 
     private final BroadcastReceiver bondReceiver = new BroadcastReceiver() {
@@ -230,6 +223,11 @@ public final class ShoeSession {
         return notificationsReady && (state == State.NEEDS_APP_PAIRING || state == State.ERROR);
     }
 
+    public boolean canConnect() {
+        return state == State.DISCONNECTED || state == State.ERROR
+                || (state == State.ALREADY_PAIRED && gatt == null);
+    }
+
     public String getLogText() {
         StringBuilder result = new StringBuilder();
         for (String line : logLines) {
@@ -244,7 +242,7 @@ public final class ShoeSession {
             if (closed) {
                 return;
             }
-            if (state != State.DISCONNECTED && state != State.ERROR) {
+            if (!canConnect()) {
                 return;
             }
             if (gatt != null) {
@@ -296,13 +294,12 @@ public final class ShoeSession {
             message("Erst die Bluetooth-Verbindung vollständig herstellen.");
             return;
         }
-        if (currentRequest != null || state == State.KEY_EXCHANGE || state == State.AUTHENTICATING) {
+        if (currentRequest != null || state == State.KEY_EXCHANGE
+                || state == State.WAITING_FOR_CONFIRMATION || state == State.AUTHENTICATING) {
             message("Die Kopplung läuft bereits.");
             return;
         }
-        handler.removeCallbacks(keyExchangeRetry);
         preferences.edit().remove(keyPreference()).apply();
-        keyExchangeAttempt = 0;
         attemptApplicationKeyExchange();
     }
 
@@ -310,37 +307,20 @@ public final class ShoeSession {
         if (!notificationsReady || currentRequest != null) {
             return;
         }
-        keyExchangeAttempt++;
-        setState(State.KEY_EXCHANGE, "Schuhtaste gedrückt halten – Versuch "
-                + keyExchangeAttempt + "/" + MAX_KEY_EXCHANGE_ATTEMPTS + " …");
-        log("CoreRF-Schlüsselaustausch gestartet, Versuch " + keyExchangeAttempt);
-        sendRequest(CoreRfProtocol.OP_START_KEY_EXCHANGE, null, 12_000L, new ResponseCallback() {
+        setState(State.KEY_EXCHANGE, "Kopplungsanfrage wird gesendet …");
+        log("CoreRF-Schlüsselaustausch gestartet");
+        sendRequest(CoreRfProtocol.OP_START_KEY_EXCHANGE, null,
+                KEY_EXCHANGE_TIMEOUT_MS, new ResponseCallback() {
             @Override
             public void onSuccess(CoreRfProtocol.Message response) {
-                Long field = CoreRfProtocol.readVarintField(response.payload, 1);
-                int group = field == null && response.payload.length == 0 ? 0 :
-                        field == null ? -1 : field.intValue();
-                log("MODP-Gruppe vom Schuh: " + group);
-                createDhKey(group);
+                acceptKeyExchangeGroup(response);
             }
 
             @Override
             public void onError(String error) {
-                retryApplicationKeyExchange(error);
+                pairingFailed(error);
             }
         });
-    }
-
-    private void retryApplicationKeyExchange(String error) {
-        if (notificationsReady && gatt != null && keyExchangeAttempt < MAX_KEY_EXCHANGE_ATTEMPTS) {
-            log("Schlüsselaustausch noch nicht angenommen: " + error);
-            setState(State.NEEDS_APP_PAIRING,
-                    "Schuhtaste weiter gedrückt halten – nächster Versuch …");
-            handler.removeCallbacks(keyExchangeRetry);
-            handler.postDelayed(keyExchangeRetry, KEY_EXCHANGE_RETRY_DELAY_MS);
-            return;
-        }
-        pairingFailed(error);
     }
 
     public void refreshBattery() {
@@ -446,14 +426,19 @@ public final class ShoeSession {
                 String detail;
                 if (status == GATT_SUCCESS) {
                     detail = "Getrennt";
+                } else if (status == 19 && disconnectedDuring == State.ALREADY_PAIRED) {
+                    detail = "Schuh bereits gekoppelt – beide Schuhe zurücksetzen und in Bluetooth vergessen.";
                 } else if (status == 19 && disconnectedDuring == State.BONDING) {
-                    detail = "Schuh hat die Kopplung beendet (Status 19). Schuhtaste halten und neu verbinden.";
+                    detail = "Schuh hat die Android-Kopplung beendet (Status 19). Neu verbinden.";
                 } else if (status == 19) {
-                    detail = "Schuh hat die Verbindung beendet (Status 19). Schuhtaste halten und neu verbinden.";
+                    detail = "Schuh hat die Verbindung beendet (Status 19). Neu verbinden.";
                 } else {
                     detail = "Bluetooth-Fehler " + status;
                 }
-                setState(status == GATT_SUCCESS ? State.DISCONNECTED : State.ERROR, detail);
+                State finalState = disconnectedDuring == State.ALREADY_PAIRED
+                        ? State.ALREADY_PAIRED
+                        : status == GATT_SUCCESS ? State.DISCONNECTED : State.ERROR;
+                setState(finalState, detail);
             }
         }
     }
@@ -524,7 +509,7 @@ public final class ShoeSession {
             setState(State.ENABLING_NOTIFICATIONS, "Benachrichtigungen werden aktiviert …");
         } else {
             setState(State.BONDING,
-                    "Schuhtaste halten – geschützte BLE-Verbindung wird aktiviert …");
+                    "Geschützte BLE-Verbindung wird aktiviert – Systemdialog bestätigen …");
         }
         if (!gatt.setCharacteristicNotification(notifyCharacteristic, true)) {
             fail("BLE-Benachrichtigungen konnten nicht aktiviert werden.");
@@ -587,7 +572,7 @@ public final class ShoeSession {
         byte[] storedKey = readStoredKey();
         if (storedKey == null) {
             setState(State.NEEDS_APP_PAIRING,
-                    "Schuhtaste gedrückt halten – Kopplung startet automatisch …");
+                    "Kopplung startet automatisch …");
             log("Kein App-Schlüssel gespeichert – automatische Kopplung");
             handler.postDelayed(this::beginApplicationPairing, 150L);
         } else {
@@ -697,11 +682,25 @@ public final class ShoeSession {
     }
 
     private void pairingFailed(String error) {
-        handler.removeCallbacks(keyExchangeRetry);
         preferences.edit().remove(keyPreference()).apply();
         log("App-Kopplung fehlgeschlagen: " + error);
-        setState(State.NEEDS_APP_PAIRING, "Kopplung fehlgeschlagen – Schuhtaste erneut halten");
+        String detail = state == State.WAITING_FOR_CONFIRMATION
+                ? "Keine Bestätigung erkannt – erneut koppeln und die leuchtende Taste kurz drücken"
+                : "Kopplung fehlgeschlagen – erneut versuchen";
+        setState(State.NEEDS_APP_PAIRING, detail);
         message(error);
+    }
+
+    private void alreadyPaired(int opcode) {
+        requests.clear();
+        clearCurrent();
+        preferences.edit().remove(keyPreference()).apply();
+        log("0x" + Integer.toHexString(opcode).toUpperCase()
+                + " NAK: Schuh hat bereits einen anderen App-Schlüssel");
+        setState(State.ALREADY_PAIRED,
+                "Anderer App-Schlüssel gespeichert – System-Reset erforderlich");
+        message("Schuh bereits gekoppelt. Nicht erneut senden: beide Schuhe zurücksetzen und "
+                + "danach beide Einträge in den Android-Bluetooth-Einstellungen vergessen.");
     }
 
     private void authenticationFailed(String error) {
@@ -851,12 +850,39 @@ public final class ShoeSession {
             }
         }
         if (currentRequest == null) {
+            if (state == State.WAITING_FOR_CONFIRMATION
+                    && CoreRfProtocol.classifyStartKeyExchangeMessage(message)
+                    == CoreRfProtocol.KeyExchangeSignal.GROUP_ACCEPTED) {
+                log("Bestätigung erkannt; MODP-Antwort empfangen");
+                acceptKeyExchangeGroup(message);
+                return;
+            }
             log("Ereignis 0x" + Integer.toHexString(message.opcode).toUpperCase());
             return;
         }
-        boolean keyExchangeEvent = currentRequest.opcode == CoreRfProtocol.OP_START_KEY_EXCHANGE
-                && message.opcode == CoreRfProtocol.OP_PUBLIC_KEY;
-        if (message.opcode != currentRequest.opcode && !keyExchangeEvent) {
+        if (currentRequest.opcode == CoreRfProtocol.OP_START_KEY_EXCHANGE) {
+            CoreRfProtocol.KeyExchangeSignal signal =
+                    CoreRfProtocol.classifyStartKeyExchangeMessage(message);
+            if (signal == CoreRfProtocol.KeyExchangeSignal.CONFIRMATION_REQUIRED) {
+                log("CoreRF wartet auf Bestätigung am Schuh");
+                setState(State.WAITING_FOR_CONFIRMATION,
+                        "Jetzt eine leuchtende Schuhtaste einmal kurz drücken (nicht halten)");
+                message("Jetzt eine der leuchtenden Tasten am Schuh einmal kurz drücken.");
+                return;
+            }
+            if (signal == CoreRfProtocol.KeyExchangeSignal.ALREADY_PAIRED) {
+                alreadyPaired(message.opcode);
+                return;
+            }
+            if (signal == CoreRfProtocol.KeyExchangeSignal.GROUP_ACCEPTED) {
+                Request completed = currentRequest;
+                clearCurrent();
+                completed.callback.onSuccess(message);
+                pumpRequests();
+                return;
+            }
+        }
+        if (message.opcode != currentRequest.opcode) {
             log("Antwort für anderen Befehl 0x" + Integer.toHexString(message.opcode).toUpperCase());
             return;
         }
@@ -864,10 +890,23 @@ public final class ShoeSession {
             finishCurrentWithError("Vom Schuh abgelehnt (NAK)");
             return;
         }
+        if (message.action != CoreRfProtocol.ACTION_ACK) {
+            log("Noch keine ACK-Antwort für 0x"
+                    + Integer.toHexString(currentRequest.opcode).toUpperCase());
+            return;
+        }
         Request completed = currentRequest;
         clearCurrent();
         completed.callback.onSuccess(message);
         pumpRequests();
+    }
+
+    private void acceptKeyExchangeGroup(CoreRfProtocol.Message response) {
+        Long field = CoreRfProtocol.readVarintField(response.payload, 1);
+        int group = field == null && response.payload.length == 0 ? 0
+                : field == null ? -1 : field.intValue();
+        log("MODP-Gruppe vom Schuh: " + group);
+        createDhKey(group);
     }
 
     private void finishCurrentWithError(String error) {
@@ -1021,7 +1060,6 @@ public final class ShoeSession {
 
     private void resetConnection() {
         handler.removeCallbacks(notificationSetupTimeout);
-        handler.removeCallbacks(keyExchangeRetry);
         notificationsReady = false;
         notificationWritePending = false;
         notificationDescriptorWritten = false;
@@ -1037,7 +1075,6 @@ public final class ShoeSession {
         rxWindowBase = 0;
         rxFrameCount = 0;
         batteryPercent = -1;
-        keyExchangeAttempt = 0;
     }
 
     private byte[] readStoredKey() {

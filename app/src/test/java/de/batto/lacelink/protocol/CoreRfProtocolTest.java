@@ -68,10 +68,41 @@ public class CoreRfProtocolTest {
         assertEquals(0, CoreRfProtocol.sequenceOf(resend));
         assertEquals(1, CoreRfProtocol.flowControlType(resend));
 
-        CoreRfProtocol.Message nak = CoreRfProtocol.parseMessage(
-                new byte[]{111, 0, (byte) 0x80});
+        CoreRfProtocol.Reassembler nakReassembler = new CoreRfProtocol.Reassembler();
+        byte[] nakBytes = nakReassembler.accept(new byte[]{
+                (byte) 0x80, 0x6f, 0x00, (byte) 0x80
+        });
+        CoreRfProtocol.Message nak = CoreRfProtocol.parseMessage(nakBytes);
         assertNotNull(nak);
         assertEquals(CoreRfProtocol.OP_PUBLIC_KEY, nak.opcode);
         assertEquals(CoreRfProtocol.ACTION_NAK, nak.action);
+        assertEquals(CoreRfProtocol.KeyExchangeSignal.ALREADY_PAIRED,
+                CoreRfProtocol.classifyStartKeyExchangeMessage(nak));
+    }
+
+    @Test
+    public void keyExchangeReadyEventDoesNotMasqueradeAsGroupResponse() {
+        CoreRfProtocol.Reassembler reassembler = new CoreRfProtocol.Reassembler();
+        byte[] bytes = reassembler.accept(new byte[]{
+                (byte) 0x80, 0x6f, 0x00, (byte) 0xc0
+        });
+        CoreRfProtocol.Message event = CoreRfProtocol.parseMessage(bytes);
+
+        assertNotNull(event);
+        assertEquals(CoreRfProtocol.OP_PUBLIC_KEY, event.opcode);
+        assertEquals(CoreRfProtocol.ACTION_EVENT, event.action);
+        assertEquals(CoreRfProtocol.KeyExchangeSignal.CONFIRMATION_REQUIRED,
+                CoreRfProtocol.classifyStartKeyExchangeMessage(event));
+    }
+
+    @Test
+    public void startKeyExchangeAckIsTheOnlyGroupResponse() {
+        CoreRfProtocol.Message response = CoreRfProtocol.parseMessage(new byte[]{
+                0x6e, 0x00, 0x40
+        });
+
+        assertNotNull(response);
+        assertEquals(CoreRfProtocol.KeyExchangeSignal.GROUP_ACCEPTED,
+                CoreRfProtocol.classifyStartKeyExchangeMessage(response));
     }
 }
