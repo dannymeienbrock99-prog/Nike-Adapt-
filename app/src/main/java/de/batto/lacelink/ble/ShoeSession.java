@@ -65,6 +65,7 @@ public final class ShoeSession {
 
     private static final String PREFS = "shoe_keys";
     private static final long NORMAL_TIMEOUT_MS = 5_000L;
+    private static final long NOTIFICATION_SETUP_TIMEOUT_MS = 30_000L;
     private static final int GATT_SUCCESS = BluetoothGatt.GATT_SUCCESS;
     private static final int GATT_INSUFFICIENT_AUTHENTICATION = 5;
     private static final int GATT_INSUFFICIENT_ENCRYPTION = 15;
@@ -93,12 +94,25 @@ public final class ShoeSession {
     private int txSequence;
     private boolean transportWritePending;
     private boolean notificationsReady;
+    private boolean notificationWritePending;
+    private boolean notificationDescriptorWritten;
     private boolean receiverRegistered;
     private boolean closed;
     private int reconnectAttempts;
     private int batteryPercent = -1;
     private State state = State.DISCONNECTED;
     private String stateDetail = "Getrennt";
+
+    private final Runnable notificationSetupTimeout = () -> {
+        if (notificationsReady || gatt == null) {
+            return;
+        }
+        String error = "System-Kopplung nicht abgeschlossen. Schuhtaste gedrückt halten, "
+                + "Android-Dialog bestätigen und erneut verbinden.";
+        disconnectAndCloseGatt();
+        resetConnection();
+        fail(error);
+    };
 
     private final BroadcastReceiver bondReceiver = new BroadcastReceiver() {
         @Override
@@ -380,6 +394,7 @@ public final class ShoeSession {
         }
         if (newState == BluetoothProfile.STATE_DISCONNECTED) {
             log("GATT getrennt, Status " + status);
+            State disconnectedDuring = state;
             boolean shouldRetry = !closed && status == 133 && reconnectAttempts < 1;
             disconnectAndCloseGatt();
             resetConnection();
@@ -388,8 +403,17 @@ public final class ShoeSession {
                 setState(State.DISCONNECTED, "Bluetooth-Fehler 133 – neuer Versuch …");
                 handler.postDelayed(this::connect, 900L);
             } else {
-                setState(status == GATT_SUCCESS ? State.DISCONNECTED : State.ERROR,
-                        status == GATT_SUCCESS ? "Getrennt" : "Bluetooth-Fehler " + status);
+                String detail;
+                if (status == GATT_SUCCESS) {
+                    detail = "Getrennt";
+                } else if (status == 19 && disconnectedDuring == State.BONDING) {
+                    detail = "Schuh hat die Kopplung beendet (Status 19). Schuhtaste halten und neu verbinden.";
+                } else if (status == 19) {
+                    detail = "Schuh hat die Verbindung beendet (Status 19). Schuhtaste halten und neu verbinden.";
+                } else {
+                    detail = "Bluetooth-Fehler " + status;
+                }
+                setState(status == GATT_SUCCESS ? State.DISCONNECTED : State.ERROR, detail);
             }
         }
     }
@@ -416,16 +440,15 @@ public final class ShoeSession {
                 batteryService.getCharacteristic(CoreRfProtocol.BATTERY_LEVEL_UUID);
         log("CoreRF-Dienst erkannt");
         try {
-            if (device.getBondState() != BluetoothDevice.BOND_BONDED) {
-                setState(State.BONDING, "Android koppelt – Taste am Schuh bestätigen …");
-                boolean started = device.createBond();
-                log(started ? "Android-Kopplung gestartet" : "Android-Kopplung konnte nicht direkt starten");
-                if (!started && device.getBondState() != BluetoothDevice.BOND_BONDING) {
-                    enableNotifications();
-                }
-            } else {
-                enableNotifications();
+            int bondState = device.getBondState();
+            log("Android-Bondstatus: " + bondStateName(bondState));
+            if (bondState != BluetoothDevice.BOND_BONDED) {
+                setState(State.BONDING,
+                        "Geschützte BLE-Verbindung wird angefordert – Systemdialog bestätigen …");
             }
+            // Do not call createBond() here. The original CoreRF flow first writes the
+            // protected CCCD; Android then starts the shoe's required system pairing.
+            enableNotifications();
         } catch (SecurityException error) {
             fail("Bluetooth-Berechtigung fehlt.");
         }
@@ -434,7 +457,17 @@ public final class ShoeSession {
     private void onBondStateChanged(int bondState) {
         if (bondState == BluetoothDevice.BOND_BONDED) {
             log("Android-Kopplung bestätigt");
-            enableNotifications();
+            if (notificationDescriptorWritten) {
+                onNotificationsReady();
+            } else if (notificationWritePending) {
+                setState(State.ENABLING_NOTIFICATIONS,
+                        "Android gekoppelt – BLE-Benachrichtigungen werden aktiviert …");
+            } else {
+                enableNotifications();
+            }
+        } else if (bondState == BluetoothDevice.BOND_BONDING) {
+            log("Android-Systemdialog für Kopplung geöffnet");
+            setState(State.BONDING, "System-Kopplung am Smartphone bestätigen …");
         } else if (bondState == BluetoothDevice.BOND_NONE && state == State.BONDING) {
             fail("Android-Kopplung abgebrochen. Beide Schuhtasten drücken und erneut verbinden.");
         }
@@ -442,10 +475,17 @@ public final class ShoeSession {
 
     @SuppressLint("MissingPermission")
     private void enableNotifications() {
-        if (notificationsReady || gatt == null || notifyCharacteristic == null) {
+        if (notificationsReady || notificationWritePending || gatt == null
+                || notifyCharacteristic == null) {
             return;
         }
-        setState(State.ENABLING_NOTIFICATIONS, "Benachrichtigungen werden aktiviert …");
+        int bondState = device.getBondState();
+        if (bondState == BluetoothDevice.BOND_BONDED) {
+            setState(State.ENABLING_NOTIFICATIONS, "Benachrichtigungen werden aktiviert …");
+        } else {
+            setState(State.BONDING,
+                    "Schuhtaste halten – geschützte BLE-Verbindung wird aktiviert …");
+        }
         if (!gatt.setCharacteristicNotification(notifyCharacteristic, true)) {
             fail("BLE-Benachrichtigungen konnten nicht aktiviert werden.");
             return;
@@ -455,22 +495,53 @@ public final class ShoeSession {
             fail("CCCD für BLE-Benachrichtigungen fehlt.");
             return;
         }
+        notificationWritePending = true;
+        handler.removeCallbacks(notificationSetupTimeout);
+        handler.postDelayed(notificationSetupTimeout, NOTIFICATION_SETUP_TIMEOUT_MS);
+        log("Geschützte CoreRF-Benachrichtigung wird aktiviert");
         enqueueGatt(GattOperation.descriptor(descriptor,
                 BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE,
-                this::onNotificationsReady,
+                this::onNotificationDescriptorWritten,
                 this::handleNotificationSetupError));
     }
 
+    @SuppressLint("MissingPermission")
+    private void onNotificationDescriptorWritten() {
+        notificationWritePending = false;
+        notificationDescriptorWritten = true;
+        log("CoreRF-CCCD geschrieben");
+        if (device.getBondState() == BluetoothDevice.BOND_BONDED) {
+            onNotificationsReady();
+        } else {
+            setState(State.BONDING, "System-Kopplung bestätigen …");
+        }
+    }
+
+    @SuppressLint("MissingPermission")
     private void handleNotificationSetupError(int status) {
+        notificationWritePending = false;
         if ((status == GATT_INSUFFICIENT_AUTHENTICATION || status == GATT_INSUFFICIENT_ENCRYPTION)
                 && device.getBondState() != BluetoothDevice.BOND_BONDED) {
+            log("CoreRF wartet auf Android-Kopplung (GATT " + status + ")");
             setState(State.BONDING, "System-Kopplung bestätigen …");
             return;
         }
+        if ((status == GATT_INSUFFICIENT_AUTHENTICATION || status == GATT_INSUFFICIENT_ENCRYPTION)
+                && device.getBondState() == BluetoothDevice.BOND_BONDED) {
+            log("Kopplung abgeschlossen; CCCD wird erneut geschrieben");
+            handler.postDelayed(this::enableNotifications, 250L);
+            return;
+        }
+        handler.removeCallbacks(notificationSetupTimeout);
         fail("Benachrichtigungen fehlgeschlagen (GATT " + status + ").");
     }
 
     private void onNotificationsReady() {
+        if (notificationsReady) {
+            return;
+        }
+        handler.removeCallbacks(notificationSetupTimeout);
+        notificationWritePending = false;
         notificationsReady = true;
         log("CoreRF-Benachrichtigungen aktiv");
         readStandardBattery();
@@ -859,7 +930,10 @@ public final class ShoeSession {
     }
 
     private void resetConnection() {
+        handler.removeCallbacks(notificationSetupTimeout);
         notificationsReady = false;
+        notificationWritePending = false;
+        notificationDescriptorWritten = false;
         writeCharacteristic = null;
         notifyCharacteristic = null;
         batteryCharacteristic = null;
@@ -924,6 +998,16 @@ public final class ShoeSession {
     private static String safeError(Throwable error) {
         String message = error.getMessage();
         return message == null || message.trim().isEmpty() ? error.getClass().getSimpleName() : message;
+    }
+
+    private static String bondStateName(int bondState) {
+        if (bondState == BluetoothDevice.BOND_BONDED) {
+            return "gekoppelt";
+        }
+        if (bondState == BluetoothDevice.BOND_BONDING) {
+            return "Kopplung läuft";
+        }
+        return "nicht gekoppelt";
     }
 
     private static byte[] copy(byte[] value) {
